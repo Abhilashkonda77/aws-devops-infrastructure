@@ -1,0 +1,244 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least-privilege default; individual jobs elevate to id-token: write only
+# where OIDC auth to AWS is actually needed.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1                      # CUSTOMIZE
+  ECR_REPOSITORY: devops-portfolio-app        # CUSTOMIZE (must match modules/ecr repo name)
+  ECS_CLUSTER_STAGING: devops-portfolio-staging-cluster
+  ECS_SERVICE_STAGING: devops-portfolio-staging-app-service
+  ECS_CLUSTER_PROD: devops-portfolio-prod-cluster
+  ECS_SERVICE_PROD: devops-portfolio-prod-app-service
+  TASK_FAMILY_STAGING: devops-portfolio-staging-app
+  TASK_FAMILY_PROD: devops-portfolio-prod-app
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Runs on every PR and every push to main.
+  # ---------------------------------------------------------------------
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: application/package-lock.json
+
+      - name: Install dependencies
+        working-directory: application
+        run: npm install
+
+      - name: Run tests
+        working-directory: application
+        run: npm test
+
+  # ---------------------------------------------------------------------
+  # Build + push only runs on merges to main (not on PRs), after tests pass.
+  # ---------------------------------------------------------------------
+  build-and-push:
+    name: Build & push image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for OIDC
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      image_uri: ${{ steps.build.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag (Git commit SHA)
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TAG: ${{ steps.vars.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$TAG"
+          docker build -f docker/Dockerfile -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Deploy to staging: register a new task definition revision pointing
+  # at the new image, update the service, wait for stability.
+  # ---------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Register new task definition revision
+        id: register
+        run: |
+          set -euo pipefail
+          CURRENT=$(aws ecs describe-task-definition \
+            --task-definition "${{ env.TASK_FAMILY_STAGING }}" \
+            --query 'taskDefinition' --output json)
+
+          NEW=$(echo "$CURRENT" | jq --arg IMAGE "${{ needs.build-and-push.outputs.image_uri }}" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          echo "task_def_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER_STAGING }}" \
+            --service "${{ env.ECS_SERVICE_STAGING }}" \
+            --task-definition "${{ steps.register.outputs.task_def_arn }}" \
+            --force-new-deployment
+
+      - name: Wait for service to become stable
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER_STAGING }}" \
+            --services "${{ env.ECS_SERVICE_STAGING }}"
+
+  smoke-test-staging:
+    name: Smoke test staging
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run smoke test against staging ALB
+        run: ./scripts/smoke-test.sh "${{ vars.STAGING_ALB_URL }}"
+
+  # ---------------------------------------------------------------------
+  # Production requires manual approval: configure a "production" GitHub
+  # Environment with required reviewers in repo Settings > Environments.
+  # This job will pause here until approved.
+  # ---------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to production
+    needs: [build-and-push, smoke-test-staging]
+    runs-on: ubuntu-latest
+    environment: production   # <-- protected environment, requires approval
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Register new task definition revision
+        id: register
+        run: |
+          set -euo pipefail
+          CURRENT=$(aws ecs describe-task-definition \
+            --task-definition "${{ env.TASK_FAMILY_PROD }}" \
+            --query 'taskDefinition' --output json)
+
+          NEW=$(echo "$CURRENT" | jq --arg IMAGE "${{ needs.build-and-push.outputs.image_uri }}" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          echo "task_def_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER_PROD }}" \
+            --service "${{ env.ECS_SERVICE_PROD }}" \
+            --task-definition "${{ steps.register.outputs.task_def_arn }}" \
+            --force-new-deployment
+
+      - name: Wait for service to become stable
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER_PROD }}" \
+            --services "${{ env.ECS_SERVICE_PROD }}"
+
+  smoke-test-prod:
+    name: Smoke test production
+    needs: deploy-prod
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run smoke test against production ALB
+        run: ./scripts/smoke-test.sh "${{ vars.PROD_ALB_URL }}"
+
+  # ---------------------------------------------------------------------
+  # ROLLBACK: this is not automated on purpose (a bad deploy to prod
+  # should not trigger an unattended rollback). If smoke-test-prod fails,
+  # roll back manually with:
+  #
+  #   aws ecs update-service \
+  #     --cluster devops-portfolio-prod-cluster \
+  #     --service devops-portfolio-prod-app-service \
+  #     --task-definition <PREVIOUS_TASK_DEF_ARN> \
+  #     --force-new-deployment
+  #
+  # Find <PREVIOUS_TASK_DEF_ARN> with:
+  #   aws ecs list-task-definitions --family-prefix devops-portfolio-prod-app --sort DESC
+  #
+  # See README.md "Troubleshooting" and docs/ARCHITECTURE.md for details.
+  # ---------------------------------------------------------------------

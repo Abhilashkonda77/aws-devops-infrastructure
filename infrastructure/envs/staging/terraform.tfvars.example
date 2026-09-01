@@ -1,0 +1,11 @@
+aws_region   = "us-east-1"
+project_name = "devops-portfolio"
+environment  = "staging"
+
+github_org  = "YOUR_GITHUB_ORG"
+github_repo = "YOUR_GITHUB_REPO"
+
+sns_alarm_email = ""
+
+# db_instance_class = "db.t4g.micro"
+# desired_count     = 2

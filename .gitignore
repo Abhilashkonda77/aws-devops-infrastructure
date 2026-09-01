@@ -1,0 +1,27 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example
+
+# Node
+node_modules/
+npm-debug.log*
+application/.env
+
+# General
+.DS_Store
+*.log
+.env
+.env.local
