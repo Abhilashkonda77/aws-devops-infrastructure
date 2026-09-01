@@ -167,6 +167,7 @@ jobs:
   # ---------------------------------------------------------------------
   deploy-prod:
     name: Deploy to production
+    if: ${{ vars.AWS_DEPLOY_ROLE_ARN_PROD != '' }}
     needs: [build-and-push, smoke-test-staging]
     runs-on: ubuntu-latest
     environment: production   # <-- protected environment, requires approval
@@ -215,6 +216,7 @@ jobs:
 
   smoke-test-prod:
     name: Smoke test production
+    if: ${{ vars.PROD_ALB_URL != '' }}
     needs: deploy-prod
     runs-on: ubuntu-latest
     environment: production
