@@ -36,9 +36,9 @@ resource "aws_s3_bucket" "terraform_state" {
   }
 
   tags = {
-    Project     = var.project_name
-    ManagedBy   = "terraform"
-    Purpose     = "terraform-remote-state"
+    Project   = var.project_name
+    ManagedBy = "terraform"
+    Purpose   = "terraform-remote-state"
   }
 }
 

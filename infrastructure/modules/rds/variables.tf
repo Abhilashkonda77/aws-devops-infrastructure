@@ -41,7 +41,7 @@ variable "multi_az" {
 
 variable "backup_retention_days" {
   type    = number
-  default = 7
+  default = 1
 }
 
 variable "deletion_protection" {
