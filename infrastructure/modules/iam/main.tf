@@ -44,8 +44,8 @@ resource "aws_iam_role_policy_attachment" "task_execution_managed" {
 
 data "aws_iam_policy_document" "task_execution_extra" {
   statement {
-    sid     = "ReadDbSecret"
-    actions = ["secretsmanager:GetSecretValue"]
+    sid       = "ReadDbSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
     resources = [var.db_secret_arn]
   }
 
@@ -141,22 +141,26 @@ data "aws_iam_policy_document" "github_actions_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Allows any branch/tag/environment within this repo. Tighten further
-    # (e.g. "repo:ORG/REPO:ref:refs/heads/main") if you want branch-level
-    # scoping per environment.
+    # GitHub immutable repository subject claims include the owner
+    # and repository IDs. Allow only this repository's main branch
+    # and staging environment workflows.
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.github_repo}:*"]
+
+      values = [
+        "repo:Abhilashkonda77@92944744/aws-devops-infrastructure@1351696261:ref:refs/heads/main",
+        "repo:Abhilashkonda77@92944744/aws-devops-infrastructure@1351696261:environment:staging",
+      ]
     }
   }
 }
 
 resource "aws_iam_role" "github_actions" {
-  name               = "${local.name}-github-actions-deploy-role"
-  assume_role_policy = data.aws_iam_policy_document.github_actions_assume.json
+  name                 = "${local.name}-github-actions-deploy-role"
+  assume_role_policy   = data.aws_iam_policy_document.github_actions_assume.json
   max_session_duration = 3600
-  tags                = var.tags
+  tags                 = var.tags
 }
 
 # Deployment permissions: push to ECR, update the ECS service, and read
@@ -164,8 +168,8 @@ resource "aws_iam_role" "github_actions" {
 # this project's resources, not "*".
 data "aws_iam_policy_document" "github_actions_deploy" {
   statement {
-    sid = "EcrAuth"
-    actions = ["ecr:GetAuthorizationToken"]
+    sid       = "EcrAuth"
+    actions   = ["ecr:GetAuthorizationToken"]
     resources = ["*"] # GetAuthorizationToken does not support resource-level scoping
   }
 
@@ -197,7 +201,7 @@ data "aws_iam_policy_document" "github_actions_deploy" {
   }
 
   statement {
-    sid = "PassRolesToEcs"
+    sid     = "PassRolesToEcs"
     actions = ["iam:PassRole"]
     resources = [
       aws_iam_role.task_execution.arn,
